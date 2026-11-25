@@ -16,6 +16,7 @@ L.Import = 'Import'
 L.EnterSearch = 'Enter Search Query:'
 L.SharePopup = 'Copy this data and share:'
 L.ImportPopup = 'Paste data to import:|n|cnERROR_COLOR:(Warning - only import filters from sources you trust)|r'
+L.ImportMacroPopup = 'This filter contains Lua macro code that can change addon data or UI behavior.|n|nReview the code before installing it.'
 
 -- automatic. do not translate unless necessary
 L.Help = HELP_LABEL

@@ -9,6 +9,170 @@ Addon.RuleEdit = Frame
 Addon.RuleEdit:Hide()
 
 
+--[[ Sharing ]]--
+
+local IMPORT_LIMIT = 65536
+local IMPORT_FIELDS = {title = 'string', search = 'string', macro = 'string', icon = 'icon'}
+local DECODE_ESCAPES = {
+	a = string.char(7), b = string.char(8), f = string.char(12), n = '\n',
+	r = '\r', t = '\t', v = string.char(11), ['\\'] = '\\', ['"'] = '"'
+}
+local ENCODE_ESCAPES = {
+	[string.char(7)] = '\\a', [string.char(8)] = '\\b', [string.char(12)] = '\\f',
+	['\n'] = '\\n', ['\r'] = '\\r', ['\t'] = '\\t', [string.char(11)] = '\\v',
+	['\\'] = '\\\\', ['"'] = '\\"'
+}
+
+local function Quote(value)
+	return '"' .. value:gsub('[%c\\"]', function(char)
+		return ENCODE_ESCAPES[char] or format('\\%03d', string.byte(char))
+	end) .. '"'
+end
+
+function Frame:Decode(encoded)
+	if type(encoded) ~= 'string' or #encoded > IMPORT_LIMIT then return end
+
+	local cursor, size = 1, #encoded
+	local function skipWhitespace()
+		while cursor <= size and encoded:sub(cursor, cursor):match('%s') do
+			cursor = cursor + 1
+		end
+	end
+
+	local function consume(expected)
+		skipWhitespace()
+		if encoded:sub(cursor, cursor) == expected then
+			cursor = cursor + 1
+			return true
+		end
+	end
+
+	local function readIdentifier()
+		skipWhitespace()
+		local first, last, identifier = encoded:find('([%a_][%w_]*)', cursor)
+		if first ~= cursor then return end
+
+		cursor = last + 1
+		return identifier
+	end
+
+	local function readString()
+		skipWhitespace()
+		if encoded:sub(cursor, cursor) ~= '"' then return end
+
+		local value = {}
+		cursor = cursor + 1
+		while cursor <= size do
+			local char = encoded:sub(cursor, cursor)
+			if char == '"' then
+				cursor = cursor + 1
+				return table.concat(value), true
+			elseif char == '\\' then
+				local escaped = encoded:sub(cursor + 1, cursor + 1)
+				if DECODE_ESCAPES[escaped] then
+					tinsert(value, DECODE_ESCAPES[escaped])
+					cursor = cursor + 2
+				elseif escaped:match('%d') then
+					local digits = escaped
+					for offset = 2, 3 do
+						local digit = encoded:sub(cursor + offset, cursor + offset)
+						if not digit:match('%d') then break end
+						digits = digits .. digit
+					end
+
+					local byte = tonumber(digits)
+					if byte > 255 then return end
+					tinsert(value, string.char(byte))
+					cursor = cursor + 1 + #digits
+				else
+					return
+				end
+			elseif char == '\n' or char == '\r' then
+				return
+			else
+				tinsert(value, char)
+				cursor = cursor + 1
+			end
+		end
+	end
+
+	local function readNumber()
+		skipWhitespace()
+		local start = cursor
+		while encoded:sub(cursor, cursor):match('[%d%.eE%+%-]') do
+			cursor = cursor + 1
+		end
+
+		local token = encoded:sub(start, cursor - 1)
+		local integer = token:match('^%-?%d+$')
+		local decimal = token:match('^%-?%d+%.%d*$') or token:match('^%-?%d*%.%d+$')
+		local exponent = token:match('^%-?%d+[eE][%+%-]?%d+$')
+			or token:match('^%-?%d+%.%d*[eE][%+%-]?%d+$')
+			or token:match('^%-?%d*%.%d+[eE][%+%-]?%d+$')
+		if not (integer or decimal or exponent) then return end
+
+		local value = tonumber(token)
+		if value == math.huge or value == -math.huge then return end
+		return value, true
+	end
+
+	local function readValue()
+		skipWhitespace()
+		if encoded:sub(cursor, cursor) == '"' then
+			return readString()
+		end
+		return readNumber()
+	end
+
+	if not consume('{') then return end
+
+	local rule, seen = {}, {}
+	repeat
+		local key = readIdentifier()
+		local expected = key and IMPORT_FIELDS[key]
+		if not expected or seen[key] or not consume('=') then return end
+
+		local value, valid = readValue()
+		if not valid or expected == 'string' and type(value) ~= 'string' then return end
+		if expected == 'icon' and type(value) ~= 'string'
+			and (type(value) ~= 'number' or value < 0 or value % 1 ~= 0) then return end
+
+		rule[key], seen[key] = value, true
+		skipWhitespace()
+		local delimiter = encoded:sub(cursor, cursor)
+		if delimiter == '}' then
+			cursor = cursor + 1
+			break
+		elseif delimiter ~= ',' then
+			return
+		end
+		cursor = cursor + 1
+	until false
+
+	skipWhitespace()
+	local code = rule.search or rule.macro
+	if cursor <= size or type(rule.title) ~= 'string' or rule.title:match('^%s*$')
+		or type(code) ~= 'string' or code:match('^%s*$') or rule.search and rule.macro then return end
+
+	return rule
+end
+
+function Frame:Encode(rule)
+	local codeKey = rule.search ~= nil and 'search' or 'macro'
+	local code = rule[codeKey]
+	if type(rule.title) ~= 'string' or type(code) ~= 'string' then return end
+
+	local encoded = format('{title=%s,%s=%s', Quote(rule.title), codeKey, Quote(code))
+	if rule.icon ~= nil then
+		local kind = type(rule.icon)
+		if kind ~= 'string' and (kind ~= 'number' or rule.icon < 0 or rule.icon % 1 ~= 0) then return end
+		local icon = kind == 'string' and Quote(rule.icon) or tostring(rule.icon)
+		encoded = encoded .. ',icon=' .. icon
+	end
+	return encoded .. '}'
+end
+
+
 --[[ Menu ]]--
 
 function Frame:OpenMenu(anchor)
@@ -39,10 +203,8 @@ function Frame:OpenMenu(anchor)
 				editBox = '',
 
 				OnAccept = function(_, encoded)
-					local ok, rule = pcall(loadstring('return ' .. encoded))
-					if ok and rule then
-						self:Create(rule)
-					end
+					local rule = self:Decode(encoded)
+					if rule then self:Import(rule) end
 				end
 			}
 		end)
@@ -96,7 +258,24 @@ function Frame:Create(rule)
 	self:Display(rule)
 end
 
-function Frame:Display(rule)
+function Frame:Import(rule)
+	if rule.macro then
+		LibStub('Sushi-3.2').Popup:New {
+			id = ADDON .. 'ImportMacroFilter',
+			button1 = OKAY, button2 = CANCEL,
+			text = L.ImportMacroPopup,
+			OnAccept = function() self:Review(rule) end
+		}
+	else
+		self:Create(rule)
+	end
+end
+
+function Frame:Review(rule)
+	self:Display(setmetatable(rule, Addon.Rules), true)
+end
+
+function Frame:Display(rule, pending)
 	self:ClearAllPoints()
 	self:Startup()
 	self:Show()
@@ -109,6 +288,7 @@ function Frame:Display(rule)
 	end
 
 	self.rule = rule
+	self.pending = pending and rule or nil
 	self.BorderBox.IconSelectorEditBox:SetText(rule:GetValue('title', frame))
 	self.CodeHeader:SetText(rule.search and L.EnterSearch or ENTER_MACRO_LABEL)
 	self.Code.EditBox:SetText(gsub(rule.macro or rule.search or '', '\t', '  '))
@@ -122,6 +302,7 @@ function Frame:Display(rule)
 end
 
 function Frame:Done()
+	self.pending = nil
 	Addon:SendSignal('RULES_CHANGED')
 	self:Hide()
 end
@@ -194,27 +375,28 @@ function Frame:OkayButton_OnClick()
 		self.rule[self.rule.search and 'search' or 'macro'] = self.Code.EditBox:GetText()
 		self.rule.icon = self.BorderBox.SelectedIconArea.SelectedIconButton:GetIconTexture()
 		self.rule.title = self.BorderBox.IconSelectorEditBox:GetText()
+		if self.pending == self.rule then
+			tinsert(Addon.sets.customRules, self.rule)
+		end
 		self:Done()
 	else
+		self.pending = nil
 		self:Hide()
 	end
 end
 
 function Frame:OnDelete()
-	tDeleteItem(Addon.sets.customRules, self.rule)
+	if self.pending ~= self.rule then
+		tDeleteItem(Addon.sets.customRules, self.rule)
+	end
 	self:Done()
 end
 
 function Frame:OnShare()
-	local encoded = ''
-	for key, value in pairs(self.rule) do
-		encoded = encoded .. format(',%s=%s', key, (type(value) == 'string' and '"' .. value:gsub('"', '\\"') .. '"' or tostring(value)))
-	end
-
 	LibStub('Sushi-3.2').Popup:New {
 		id = ADDON .. 'ShareFilter',
 		text = L.SharePopup, button1 = OKAY,
-		editBox = '{' .. encoded:sub(2) .. '}'
+		editBox = self:Encode(self.rule)
 	}
 end
 
